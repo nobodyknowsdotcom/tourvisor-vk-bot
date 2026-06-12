@@ -53,8 +53,8 @@ fn crop_to_carousel_ratio(bytes: &[u8]) -> Vec<u8> {
 
 pub const TOURS_BUTTON: &str = "Запросить туры";
 pub const SHOW_BUTTON: &str = "Показать туры";
-pub const CHART_BUTTON: &str = "График цен";
-pub const AVG_BUTTON: &str = "Средние цены";
+pub const CHART_BUTTON: &str = "График";
+pub const RETRO_BUTTON: &str = "Ретроспективный график";
 
 impl Vk {
     pub fn new(client: reqwest::Client, token: String) -> Self {
@@ -94,7 +94,7 @@ impl Vk {
                 "color": "secondary"
             }),
             json!({
-                "action": { "type": "text", "label": AVG_BUTTON, "payload": "{\"cmd\":\"avg\"}" },
+                "action": { "type": "text", "label": RETRO_BUTTON, "payload": "{\"cmd\":\"retro\"}" },
                 "color": "secondary"
             }),
         ];

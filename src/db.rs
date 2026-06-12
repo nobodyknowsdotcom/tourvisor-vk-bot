@@ -54,6 +54,10 @@ impl Db {
             "ALTER TABLE regular_day_prices ADD COLUMN min_all INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE hot_tours ADD COLUMN region_code INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_hot_tours_tour_id ON hot_tours (tour_id)",
             [],
@@ -71,8 +75,8 @@ impl Db {
             let mut upsert_stmt = tx.prepare(
                 "INSERT INTO hot_tours
                  (tour_id, fetched_on, country, departure, hotel_code, hotel_name, hotel_stars,
-                  region, rating, picture_url, hotel_url, price, price_old, nights, fly_date, return_date, meal)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                  region, region_code, rating, picture_url, hotel_url, price, price_old, nights, fly_date, return_date, meal)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
                  ON CONFLICT (tour_id) DO UPDATE SET
                     price = excluded.price,
                     price_old = excluded.price_old,
@@ -82,12 +86,14 @@ impl Db {
                     meal = excluded.meal,
                     rating = excluded.rating,
                     picture_url = excluded.picture_url,
-                    hotel_url = excluded.hotel_url
+                    hotel_url = excluded.hotel_url,
+                    region_code = excluded.region_code
                  WHERE price != excluded.price
                     OR price_old != excluded.price_old
                     OR fly_date != excluded.fly_date
                     OR nights != excluded.nights
-                    OR hotel_url != excluded.hotel_url",
+                    OR hotel_url != excluded.hotel_url
+                    OR region_code != excluded.region_code",
             )?;
             for t in tours {
                 let existed = exists_stmt.exists(params![t.tour_id])?;
@@ -100,6 +106,7 @@ impl Db {
                     t.hotel_name,
                     t.hotel_stars,
                     t.region,
+                    t.region_code,
                     t.rating,
                     t.picture_url,
                     t.hotel_url,
@@ -150,7 +157,7 @@ impl Db {
         let to = (today + chrono::Duration::days(to_days)).to_string();
         let mut stmt = self.conn.prepare(
             "SELECT tour_id, country, departure, hotel_code, hotel_name, hotel_stars,
-                    region, rating, picture_url, hotel_url, price, price_old, nights, fly_date, return_date, meal
+                    region, region_code, rating, picture_url, hotel_url, price, price_old, nights, fly_date, return_date, meal
              FROM hot_tours
              WHERE fly_date > ?1 AND fly_date < ?2 AND nights BETWEEN ?3 AND ?4
                AND id IN (SELECT MIN(id) FROM hot_tours GROUP BY tour_id)
@@ -166,15 +173,16 @@ impl Db {
                     hotel_name: row.get(4)?,
                     hotel_stars: row.get(5)?,
                     region: row.get(6)?,
-                    rating: row.get(7)?,
-                    picture_url: row.get(8)?,
-                    hotel_url: row.get(9)?,
-                    price: row.get(10)?,
-                    price_old: row.get(11)?,
-                    nights: row.get(12)?,
-                    fly_date: row.get::<_, String>(13)?.parse().expect("дата в БД"),
-                    return_date: row.get::<_, String>(14)?.parse().expect("дата в БД"),
-                    meal: row.get(15)?,
+                    region_code: row.get(7)?,
+                    rating: row.get(8)?,
+                    picture_url: row.get(9)?,
+                    hotel_url: row.get(10)?,
+                    price: row.get(11)?,
+                    price_old: row.get(12)?,
+                    nights: row.get(13)?,
+                    fly_date: row.get::<_, String>(14)?.parse().expect("дата в БД"),
+                    return_date: row.get::<_, String>(15)?.parse().expect("дата в БД"),
+                    meal: row.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -234,6 +242,39 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Some((last.parse().expect("дата в БД"), rows)))
+    }
+}
+
+impl Db {
+    /// История цен обычных туров по дням вылета в диапазоне дат:
+    /// (день вылета, минимум из самого раннего снимка, минимум из самого свежего).
+    pub fn day_price_history(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<(NaiveDate, u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fly_date,
+                    (SELECT min_price FROM regular_day_prices p2
+                      WHERE p2.fly_date = p1.fly_date AND p2.min_price > 0
+                      ORDER BY fetched_on ASC LIMIT 1),
+                    (SELECT min_price FROM regular_day_prices p2
+                      WHERE p2.fly_date = p1.fly_date AND p2.min_price > 0
+                      ORDER BY fetched_on DESC LIMIT 1)
+             FROM regular_day_prices p1
+             WHERE fly_date BETWEEN ?1 AND ?2 AND min_price > 0
+             GROUP BY fly_date ORDER BY fly_date",
+        )?;
+        let rows = stmt
+            .query_map(params![from.to_string(), to.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?.parse().expect("дата в БД"),
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 

@@ -24,6 +24,8 @@ struct RawHotTour {
     hotelstars: String,
     hotelregionname: String,
     #[serde(default)]
+    hotelregioncode: String,
+    #[serde(default)]
     hotelrating: String,
     #[serde(default)]
     hotelpicture: String,
@@ -42,6 +44,8 @@ pub struct HotTour {
     pub hotel_name: String,
     pub hotel_stars: u8,
     pub region: String,
+    /// Код региона tourvisor (87 = Нячанг); 0, если не разобрался
+    pub region_code: u32,
     pub rating: String,
     pub picture_url: String,
     /// Ссылка на поиск по этому отелю на tourvisor (для кликабельной карточки)
@@ -99,6 +103,7 @@ fn parse_tour(raw: RawHotTour, city: u32, country: u32) -> Result<HotTour> {
         hotel_name: raw.hotelname,
         hotel_stars: raw.hotelstars.parse().unwrap_or(0),
         region: raw.hotelregionname,
+        region_code: raw.hotelregioncode.parse().unwrap_or(0),
         rating: raw.hotelrating,
         picture_url: raw.hotelpicture,
         hotel_url,
@@ -145,22 +150,29 @@ pub async fn fetch_month_prices(
     adults: u32,
     (nights_from, nights_to): (u32, u32),
     price_limit: u64,
+    regions: &[u32],
     exclude_ids: &std::collections::HashSet<String>,
     today: NaiveDate,
 ) -> Result<MonthPrices> {
+    let mut query = vec![
+        ("format", "json".to_string()),
+        ("departure", city.to_string()),
+        ("country", country.to_string()),
+        ("datefrom", (today + Duration::days(1)).format("%d.%m.%Y").to_string()),
+        ("dateto", (today + Duration::days(SEARCH_DAYS)).format("%d.%m.%Y").to_string()),
+        ("nightsfrom", nights_from.to_string()),
+        ("nightsto", nights_to.to_string()),
+        ("adults", adults.to_string()),
+        ("child", "0".to_string()),
+    ];
+    if !regions.is_empty() {
+        let joined = regions.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        query.push(("regions", joined));
+    }
+
     let started: serde_json::Value = client
         .get(SEARCH_URL)
-        .query(&[
-            ("format", "json".to_string()),
-            ("departure", city.to_string()),
-            ("country", country.to_string()),
-            ("datefrom", (today + Duration::days(1)).format("%d.%m.%Y").to_string()),
-            ("dateto", (today + Duration::days(SEARCH_DAYS)).format("%d.%m.%Y").to_string()),
-            ("nightsfrom", nights_from.to_string()),
-            ("nightsto", nights_to.to_string()),
-            ("adults", adults.to_string()),
-            ("child", "0".to_string()),
-        ])
+        .query(&query)
         .header("Referer", "https://tourvisor.ru/")
         .send()
         .await
@@ -223,11 +235,6 @@ pub async fn fetch_month_prices(
 /// Минимальная цена горящих туров на каждый день вылета (для графика-наложения).
 pub fn hot_day_prices(tours: &[HotTour]) -> Vec<(NaiveDate, u64)> {
     day_min(&tours.iter().map(|t| (t.fly_date, t.price)).collect::<Vec<_>>())
-}
-
-/// Средняя цена горящих туров на каждый день вылета.
-pub fn hot_day_avg(tours: &[HotTour]) -> Vec<(NaiveDate, u64)> {
-    day_avg(&tours.iter().map(|t| (t.fly_date, t.price)).collect::<Vec<_>>())
 }
 
 fn day_min(pairs: &[(NaiveDate, u64)]) -> Vec<(NaiveDate, u64)> {

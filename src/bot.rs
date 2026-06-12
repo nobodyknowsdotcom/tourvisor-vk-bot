@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::db::Db;
 use crate::tourvisor;
-use crate::vk::{Vk, AVG_BUTTON, CHART_BUTTON, SHOW_BUTTON, TOURS_BUTTON};
+use crate::chart::{Series, COLOR_HOT, COLOR_HOT_OLD, COLOR_REGULAR, COLOR_REGULAR_OLD};
+use crate::vk::{Vk, CHART_BUTTON, RETRO_BUTTON, SHOW_BUTTON, TOURS_BUTTON};
 
 /// Слушает Bots Long Poll и отвечает на сообщения:
 /// кнопка «Запросить туры» запускает сбор, всё остальное — «не понимаю».
@@ -115,15 +116,18 @@ async fn handle_message(
         || text.trim().to_lowercase() == "туры";
     let asked_show = payload.contains("\"cmd\":\"show\"")
         || text.trim().eq_ignore_ascii_case(SHOW_BUTTON);
-    let asked_chart = payload.contains("\"cmd\":\"chart\"")
-        || text.trim().eq_ignore_ascii_case(CHART_BUTTON)
-        || text.trim().to_lowercase() == "график";
-    let asked_avg = payload.contains("\"cmd\":\"avg\"")
-        || text.trim().eq_ignore_ascii_case(AVG_BUTTON);
+    // RETRO_BUTTON начинается со слова, похожего на CHART_BUTTON — проверяем ретро первым.
+    let asked_retro = payload.contains("\"cmd\":\"retro\"")
+        || text.trim().eq_ignore_ascii_case(RETRO_BUTTON)
+        || text.trim().to_lowercase() == "ретро";
+    let asked_chart = !asked_retro
+        && (payload.contains("\"cmd\":\"chart\"")
+            || text.trim().eq_ignore_ascii_case(CHART_BUTTON)
+            || text.trim().to_lowercase() == "график");
 
     if asked_chart {
         // Только данные из базы — на tourvisor по кнопкам не ходим.
-        if let Err(e) = send_month_charts(cfg, db, vk, peer_id).await {
+        if let Err(e) = send_chart(cfg, db, vk, peer_id).await {
             eprintln!("график не получился: {e:#}");
             vk.send_text(
                 peer_id,
@@ -134,13 +138,12 @@ async fn handle_message(
         return Ok(());
     }
 
-    if asked_avg {
-        // Средние считаем только по уже спарсенным данным — без походов на tourvisor.
-        if let Err(e) = send_avg_chart(cfg, db, vk, peer_id).await {
-            eprintln!("график средних не получился: {e:#}");
+    if asked_retro {
+        if let Err(e) = send_retro_chart(db, vk, peer_id).await {
+            eprintln!("ретроспективный график не получился: {e:#}");
             vk.send_text(
                 peer_id,
-                &format!("Пока нечего усреднять — сначала собери данные кнопкой «{TOURS_BUTTON}»."),
+                &format!("Для ретроспективы пока мало данных — собери их кнопкой «{TOURS_BUTTON}»."),
             )
             .await?;
         }
@@ -185,7 +188,7 @@ async fn handle_message(
             peer_id,
             &format!(
                 "💾 Сегодня уже парсили, данные в базе. Карточки — «{SHOW_BUTTON}», \
-                 графики — «{CHART_BUTTON}» и «{AVG_BUTTON}»."
+                 графики — «{CHART_BUTTON}» и «{RETRO_BUTTON}»."
             ),
         )
         .await?;
@@ -208,7 +211,7 @@ async fn handle_message(
         &format!(
             "✅ Готово. Всего горящих туров: {}, в окне вылета ({}–{} дн.): {}. \
              Новых в БД: {}, обновлено: {}. Цены по дням за 1,5 месяца сохранены.\n\
-             Карточки — «{SHOW_BUTTON}», графики — «{CHART_BUTTON}» и «{AVG_BUTTON}».",
+             Карточки — «{SHOW_BUTTON}», графики — «{CHART_BUTTON}» и «{RETRO_BUTTON}».",
             stats.total,
             cfg.window_days.0,
             cfg.window_days.1,
@@ -239,7 +242,12 @@ pub async fn parse_session(
 ) -> Result<ParseStats> {
     let today = Local::now().date_naive();
 
-    let all = tourvisor::fetch_hot_tours(client, cfg.tv_city, cfg.tv_country).await?;
+    // modhot параметр regions игнорирует — горящие фильтруем по коду региона сами.
+    let all: Vec<_> = tourvisor::fetch_hot_tours(client, cfg.tv_city, cfg.tv_country)
+        .await?
+        .into_iter()
+        .filter(|t| cfg.tv_regions.is_empty() || cfg.tv_regions.contains(&t.region_code))
+        .collect();
     let mut tours: Vec<_> = all
         .iter()
         .filter(|t| {
@@ -261,6 +269,7 @@ pub async fn parse_session(
         cfg.adults,
         cfg.nights,
         cfg.price_limit,
+        &cfg.tv_regions,
         &hot_ids,
         today,
     )
@@ -289,9 +298,9 @@ pub async fn parse_session(
     })
 }
 
-/// Два графика из БД: общий минимум по дням и наложение
-/// «обычные до лимита vs горящие». На tourvisor не ходит.
-pub async fn send_month_charts(cfg: &Config, db: &Mutex<Db>, vk: &Vk, peer_id: i64) -> Result<()> {
+/// Один график из БД: минимальные цены по дням вылета,
+/// обычные туры (до лимита) и горящие подписаны отдельно. На tourvisor не ходит.
+pub async fn send_chart(cfg: &Config, db: &Mutex<Db>, vk: &Vk, peer_id: i64) -> Result<()> {
     let today = Local::now().date_naive();
     let (cached, hot_tours) = {
         let db = db.lock().unwrap();
@@ -300,91 +309,116 @@ pub async fn send_month_charts(cfg: &Config, db: &Mutex<Db>, vk: &Vk, peer_id: i
     let (fetched, rows) = cached.context("в БД нет цен по дням")?;
     anyhow::ensure!(!rows.is_empty(), "в БД нет цен по дням");
 
-    let min_all: Vec<_> = rows.iter().map(|r| (r.fly_date, r.min_all)).collect();
-    let min_capped: Vec<_> = rows
+    let regular: Vec<_> = rows
         .iter()
         .filter(|r| r.min_capped > 0)
         .map(|r| (r.fly_date, r.min_capped))
         .collect();
+    let hot = tourvisor::hot_day_prices(&hot_tours);
     let stale_note = if fetched == today {
         String::new()
     } else {
         format!(" (данные за {})", fetched.format("%d.%m"))
     };
 
+    let series = [
+        Series {
+            label: format!("Обычные туры (до {} тыс. ₽)", cfg.price_limit / 1000),
+            color: COLOR_REGULAR,
+            points: regular,
+        },
+        Series {
+            label: "Горящие туры".into(),
+            color: COLOR_HOT,
+            points: hot,
+        },
+    ];
     let title = format!(
-        "Мин. цена тура по дням вылета ({} взр., {}–{} ночей)",
+        "Мин. цены по дням вылета ({} взр., {}–{} ночей)",
         cfg.adults, cfg.nights.0, cfg.nights.1
     );
-    let png = crate::chart::render_price_chart(&min_all, &title)?;
-    let (cheapest_date, cheapest) = min_all
-        .iter()
-        .min_by_key(|(_, p)| *p)
-        .copied()
-        .expect("min_all не пуст");
+    let png = crate::chart::render_chart(&title, &series)?;
     vk.send_photo(
         peer_id,
         png,
         &format!(
-            "📈 Цены на 1,5 месяца вперёд{stale_note}. Дешевле всего {} — {} ₽.",
-            cheapest_date.format("%d.%m"),
-            cheapest
-        ),
-    )
-    .await?;
-
-    let hot_points = tourvisor::hot_day_prices(&hot_tours);
-    let overlay_title = format!(
-        "Обычные туры до {} тыс. руб. vs горящие",
-        cfg.price_limit / 1000
-    );
-    let overlay_png =
-        crate::chart::render_overlay_chart(&min_capped, &hot_points, &overlay_title)?;
-    vk.send_photo(
-        peer_id,
-        overlay_png,
-        &format!(
-            "📊 Сравнение за те же 1,5 месяца: обычные туры до {} тыс. ₽ и горящие.",
-            cfg.price_limit / 1000
+            "📊 Цены на 1,5 месяца вперёд{stale_note}: синим — обычные туры, красным — горящие."
         ),
     )
     .await
 }
 
-/// График средних цен за 1,5 месяца по уже собранным данным из БД:
-/// обычные туры (до лимита) vs горящие. На tourvisor не ходит.
-pub async fn send_avg_chart(cfg: &Config, db: &Mutex<Db>, vk: &Vk, peer_id: i64) -> Result<()> {
+/// Ретроспективный график из БД: окно «сейчас − месяц … сейчас + месяц»,
+/// старые и новые цены обычных и горящих туров. На tourvisor не ходит.
+pub async fn send_retro_chart(db: &Mutex<Db>, vk: &Vk, peer_id: i64) -> Result<()> {
     let today = Local::now().date_naive();
-    let (day_prices, hot_tours) = {
+    let from = today - chrono::Duration::days(30);
+    let to = today + chrono::Duration::days(30);
+
+    let (history, hot_tours) = {
         let db = db.lock().unwrap();
-        (db.latest_day_prices()?, db.load_upcoming(today)?)
+        (
+            db.day_price_history(from, to)?,
+            db.load_relevant(today, (-31, 31), (0, 99))?,
+        )
     };
 
-    let regular_avg: Vec<_> = day_prices
-        .map(|(_, rows)| rows)
-        .unwrap_or_default()
+    // Обычные: минимум из первого снимка («было») и из последнего («сейчас»).
+    let regular_old: Vec<_> = history.iter().map(|&(d, first, _)| (d, first)).collect();
+    let regular_new: Vec<_> = history.iter().map(|&(d, _, last)| (d, last)).collect();
+
+    // Горящие: по каждому дню — самый дешёвый тур, его цена и его старая цена.
+    let mut cheapest: std::collections::BTreeMap<chrono::NaiveDate, (u64, u64)> = Default::default();
+    for t in &hot_tours {
+        let entry = cheapest.entry(t.fly_date).or_insert((t.price, t.price_old));
+        if t.price < entry.0 {
+            *entry = (t.price, t.price_old);
+        }
+    }
+    let hot_new: Vec<_> = cheapest.iter().map(|(&d, &(p, _))| (d, p)).collect();
+    let hot_old: Vec<_> = cheapest
         .iter()
-        .filter(|r| r.avg_capped > 0)
-        .map(|r| (r.fly_date, r.avg_capped))
+        .filter(|(_, &(_, old))| old > 0)
+        .map(|(&d, &(_, old))| (d, old))
         .collect();
-    let hot_avg = tourvisor::hot_day_avg(&hot_tours);
+
     anyhow::ensure!(
-        !regular_avg.is_empty() || !hot_avg.is_empty(),
-        "в БД ещё нет данных для графика средних цен"
+        !regular_new.is_empty() || !hot_new.is_empty(),
+        "в БД нет данных за этот период"
     );
 
+    let series = [
+        Series {
+            label: "Обычные: было".into(),
+            color: COLOR_REGULAR_OLD,
+            points: regular_old,
+        },
+        Series {
+            label: "Обычные: сейчас".into(),
+            color: COLOR_REGULAR,
+            points: regular_new,
+        },
+        Series {
+            label: "Горящие: было".into(),
+            color: COLOR_HOT_OLD,
+            points: hot_old,
+        },
+        Series {
+            label: "Горящие: сейчас".into(),
+            color: COLOR_HOT,
+            points: hot_new,
+        },
+    ];
     let title = format!(
-        "Средние цены за 1,5 месяца: обычные до {} тыс. руб. vs горящие",
-        cfg.price_limit / 1000
+        "Ретроспектива цен: {} — {}",
+        from.format("%d.%m"),
+        to.format("%d.%m")
     );
-    let png = crate::chart::render_overlay_chart(&regular_avg, &hot_avg, &title)?;
+    let png = crate::chart::render_chart(&title, &series)?;
     vk.send_photo(
         peer_id,
         png,
-        &format!(
-            "📊 Средние цены по дням вылета за 1,5 месяца (по собранным данным): обычные туры до {} тыс. ₽ и горящие.",
-            cfg.price_limit / 1000
-        ),
+        "📜 Ретроспектива за ±месяц (только данные из базы): светлым — старые цены, ярким — текущие; синие — обычные туры, красные — горящие.",
     )
     .await
 }

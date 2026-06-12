@@ -97,8 +97,8 @@ async fn run(
         if let Err(e) = vk.send_digest(peer_id, &tours).await {
             eprintln!("не отправилось peer_id={peer_id}: {e:#}");
         }
-        if let Err(e) = bot::send_month_charts(cfg, db, vk, peer_id).await {
-            eprintln!("графики для peer_id={peer_id} не отправились: {e:#}");
+        if let Err(e) = bot::send_chart(cfg, db, vk, peer_id).await {
+            eprintln!("график для peer_id={peer_id} не отправился: {e:#}");
         }
     }
     Ok(())

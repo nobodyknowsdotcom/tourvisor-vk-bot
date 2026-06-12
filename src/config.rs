@@ -21,6 +21,9 @@ pub struct Config {
     pub nights: (u32, u32),
     /// Потолок цены для «обычных» туров на втором графике, ₽
     pub price_limit: u64,
+    /// Коды регионов tourvisor (пусто — вся страна).
+    /// Горящие фильтруются на нашей стороне, в поиске передаётся параметр regions.
+    pub tv_regions: Vec<u32>,
 }
 
 impl Config {
@@ -86,6 +89,13 @@ impl Config {
                 .unwrap_or_else(|_| "300000".into())
                 .parse()
                 .context("PRICE_LIMIT: ожидается число")?,
+            // По умолчанию Нячанг: 87 + подзоны 2570 (центр) и 2571 (Доклет)
+            tv_regions: std::env::var("TV_REGIONS")
+                .unwrap_or_else(|_| "87,2570,2571".into())
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<u32>().context("TV_REGIONS: ожидаются числа"))
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
