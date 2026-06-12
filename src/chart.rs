@@ -2,12 +2,31 @@ use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use plotters::prelude::*;
 
+/// Регистрирует вшитый в бинарь шрифт (бэкенд ab_glyph не видит системные шрифты).
+fn ensure_fonts() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let font: &'static [u8] = include_bytes!("../assets/DejaVuSans.ttf");
+        for style in [
+            plotters::style::FontStyle::Normal,
+            plotters::style::FontStyle::Bold,
+            plotters::style::FontStyle::Italic,
+        ] {
+            if plotters::style::register_font("sans-serif", style, font).is_err() {
+                eprintln!("не удалось зарегистрировать шрифт графиков");
+                return;
+            }
+        }
+    });
+}
+
 /// Рисует наложение двух ценовых рядов (обычные и горящие туры) и возвращает PNG.
 pub fn render_overlay_chart(
     regular: &[(NaiveDate, u64)],
     hot: &[(NaiveDate, u64)],
     title: &str,
 ) -> Result<Vec<u8>> {
+    ensure_fonts();
     anyhow::ensure!(!regular.is_empty() || !hot.is_empty(), "нет точек для графика");
 
     let all: Vec<(NaiveDate, u64)> = regular.iter().chain(hot.iter()).copied().collect();
@@ -78,6 +97,7 @@ pub fn render_overlay_chart(
 
 /// Рисует график «день вылета → минимальная цена» и возвращает PNG.
 pub fn render_price_chart(points: &[(NaiveDate, u64)], title: &str) -> Result<Vec<u8>> {
+    ensure_fonts();
     anyhow::ensure!(!points.is_empty(), "нет точек для графика");
 
     let path = std::env::temp_dir().join(format!("tv_chart_{}.png", std::process::id()));
